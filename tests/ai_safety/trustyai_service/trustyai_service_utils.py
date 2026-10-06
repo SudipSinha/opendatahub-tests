@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import quote
 
 import requests
 import structlog
@@ -91,6 +92,7 @@ class TrustyAIServiceClient:
         data: str | bytes | None = None,
         json: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         """Sends HTTP request to specified TrustyAIService endpoint.
 
@@ -100,6 +102,7 @@ class TrustyAIServiceClient:
             data (str | bytes | None): Request body data.
             json (dict[str, Any] | None): JSON data to send.
             extra_headers (dict[str, str] | None): Additional headers to merge with defaults.
+            timeout (float | None): Optional request timeout in seconds.
 
         Returns:
             Any: Response from the request.
@@ -110,7 +113,9 @@ class TrustyAIServiceClient:
 
         url = f"https://{self.service_route.host}/{endpoint.lstrip('/')}"
         headers = {**self.headers, **(extra_headers or {})}
-        base_kwargs = {"url": url, "headers": headers, "verify": self.cert_path}
+        base_kwargs: dict[str, Any] = {"url": url, "headers": headers, "verify": self.cert_path}
+        if timeout is not None:
+            base_kwargs["timeout"] = timeout
 
         method = method.upper()
         if method not in ("GET", "POST", "DELETE"):
@@ -121,6 +126,49 @@ class TrustyAIServiceClient:
             return requests.post(**base_kwargs, data=data, json=json)  # type: ignore[arg-type]
         elif method == "DELETE":
             return requests.delete(**base_kwargs, json=json)  # type: ignore[arg-type]
+
+    def get_inference_ids(
+        self,
+        model_name: str,
+        inference_type: str = "organic",
+        timeout: float | None = None,
+    ) -> requests.Response:
+        """Get stored inference IDs for a model.
+
+        Args:
+            model_name (str): Stored TrustyAI model name.
+            inference_type (str): ID filter accepted by the service.
+            timeout (float | None): Optional request timeout in seconds.
+
+        Returns:
+            requests.Response: Response containing paginated inference IDs.
+        """
+        endpoint = f"info/inference/ids/{quote(model_name, safe='')}?type={quote(inference_type, safe='')}&limit=10000"
+        return self._send_request(endpoint=endpoint, method="GET", timeout=timeout)
+
+    def request_local_explanation(
+        self,
+        algorithm: str,
+        payload: dict[str, Any],
+        timeout: float | None = None,
+    ) -> requests.Response:
+        """Request one local LIME or SHAP explanation.
+
+        Args:
+            algorithm (str): Local explainer name, either ``lime`` or ``shap``.
+            payload (dict[str, Any]): Public local explainer request body.
+            timeout (float | None): Optional request timeout in seconds.
+
+        Returns:
+            requests.Response: Response from the local explainer endpoint.
+
+        Raises:
+            ValueError: If the algorithm is not supported.
+        """
+        if algorithm not in {"lime", "shap"}:
+            raise ValueError(f"Unsupported local explanation algorithm: {algorithm}")
+        endpoint = f"explainers/local/{algorithm}"
+        return self._send_request(endpoint=endpoint, method="POST", json=payload, timeout=timeout)
 
     def get_model_metadata(self) -> requests.Response:
         """Gets metadata information about the model from TrustyAIService.
@@ -133,11 +181,13 @@ class TrustyAIServiceClient:
     def upload_data(
         self,
         data_path: str,
+        timeout: float | None = None,
     ) -> requests.Response:
         """Uploads data file to TrustyAIService.
 
         Args:
             data_path (str): Path to data file to upload.
+            timeout (float | None): Optional request timeout in seconds.
 
         Returns:
             requests.Response: Response from upload request.
@@ -147,7 +197,12 @@ class TrustyAIServiceClient:
             data = file.read()
 
         LOGGER.info(f"Uploading data to TrustyAIService: {data_path}")
-        return self._send_request(endpoint=self.Endpoints.DATA_UPLOAD, method="POST", data=data)
+        return self._send_request(
+            endpoint=self.Endpoints.DATA_UPLOAD,
+            method="POST",
+            data=data,
+            timeout=timeout,
+        )
 
     def upload_gzip_data(self, data_path: str) -> requests.Response:
         """Uploads gzip-compressed data to TrustyAI's /data/upload endpoint.

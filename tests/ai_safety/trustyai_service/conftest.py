@@ -1,6 +1,7 @@
 import json
 import secrets
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,6 +22,7 @@ from ocp_resources.trustyai_service import TrustyAIService
 from pytest_testconfig import py_config
 
 from tests.ai_safety.trustyai_service.constants import (
+    DRIFT_BASE_DATA_PATH,
     GAUSSIAN_CREDIT_MODEL,
     GAUSSIAN_CREDIT_MODEL_RESOURCES,
     GAUSSIAN_CREDIT_MODEL_STORAGE_URI,
@@ -32,7 +34,13 @@ from tests.ai_safety.trustyai_service.constants import (
     TAI_PVC_STORAGE_CONFIG,
     XGBOOST,
 )
+from tests.ai_safety.trustyai_service.explainability.utils import (
+    configure_local_explainers,
+    get_internal_model_url,
+    upload_training_data_and_get_prediction_id,
+)
 from tests.ai_safety.trustyai_service.trustyai_service_utils import (
+    TrustyAIServiceClient,
     wait_for_isvc_deployment_registered_by_trustyai_service,
 )
 from tests.ai_safety.trustyai_service.utils import (
@@ -351,6 +359,105 @@ def gaussian_credit_model(
                 runtime_name=mlserver_runtime.name,
             )
             yield isvc
+
+
+@pytest.fixture(scope="class")
+def explainability_gaussian_credit_model(
+    pytestconfig: pytest.Config,
+    admin_client: DynamicClient,
+    model_namespace: Namespace,
+    mlserver_runtime: ServingRuntime,
+    kserve_raw_config: ConfigMap,
+    kserve_logger_ca_bundle: ConfigMap,
+    teardown_resources: bool,
+) -> Generator[InferenceService, Any, Any]:
+    """Provides an internal unauthenticated model endpoint for local explanations."""
+    model_namespace_name = model_namespace.name
+    runtime_name = mlserver_runtime.name
+    assert model_namespace_name is not None
+    assert runtime_name is not None
+    explainability_model_kwargs = {
+        "client": admin_client,
+        "namespace": model_namespace_name,
+        "name": GAUSSIAN_CREDIT_MODEL,
+    }
+
+    if pytestconfig.option.post_upgrade:
+        isvc = InferenceService(**explainability_model_kwargs)
+        yield isvc
+        isvc.clean_up()
+    else:
+        with create_isvc(
+            deployment_mode=KServeDeploymentType.RAW_DEPLOYMENT,
+            model_format=XGBOOST,
+            runtime=runtime_name,
+            storage_uri=GAUSSIAN_CREDIT_MODEL_STORAGE_URI,
+            enable_auth=False,
+            external_route=False,
+            wait_for_predictor_pods=False,
+            resources=GAUSSIAN_CREDIT_MODEL_RESOURCES,
+            teardown=teardown_resources,
+            **explainability_model_kwargs,
+        ) as isvc:
+            wait_for_isvc_deployment_registered_by_trustyai_service(
+                client=admin_client,
+                isvc=isvc,
+                runtime_name=runtime_name,
+            )
+            yield isvc
+
+
+@pytest.fixture(scope="class")
+def explainability_model_url(
+    admin_client: DynamicClient,
+    explainability_gaussian_credit_model: InferenceService,
+    mlserver_runtime: ServingRuntime,
+) -> str:
+    """Provides the cluster-local KServe server root used by local explainers."""
+    runtime_name = mlserver_runtime.name
+    assert runtime_name is not None
+    return get_internal_model_url(
+        client=admin_client,
+        inference_service=explainability_gaussian_credit_model,
+        runtime_name=runtime_name,
+    )
+
+
+@pytest.fixture(scope="class")
+def explainability_trustyai_service(
+    admin_client: DynamicClient,
+    trustyai_service: TrustyAIService,
+    explainability_model_url: str,
+) -> Generator[TrustyAIService, Any, Any]:
+    """Provides a TrustyAI service with local explainers enabled for the test."""
+    with configure_local_explainers(
+        client=admin_client,
+        trustyai_service=trustyai_service,
+        model_url=explainability_model_url,
+    ):
+        yield trustyai_service
+
+
+@pytest.fixture(scope="class")
+def explainability_prediction_id(
+    admin_client: DynamicClient,
+    current_client_token: str,
+    explainability_trustyai_service: TrustyAIService,
+    explainability_gaussian_credit_model: InferenceService,
+) -> str:
+    """Provides one prediction ID created from the explainability background upload."""
+    client = TrustyAIServiceClient(
+        token=current_client_token,
+        service=explainability_trustyai_service,
+        client=admin_client,
+    )
+    model_name = explainability_gaussian_credit_model.name
+    assert model_name is not None
+    return upload_training_data_and_get_prediction_id(
+        client=client,
+        data_path=Path(DRIFT_BASE_DATA_PATH) / "training_data.json",
+        model_name=model_name,
+    )
 
 
 @pytest.fixture(scope="class")
